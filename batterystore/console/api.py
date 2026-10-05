@@ -65,6 +65,11 @@ class Api:
         add("GET", "/api/fire", lambda params, body: self._platform.fire_snapshot())
         add("GET", "/api/grid", lambda params, body: self._platform.grid_snapshot())
         add("GET", "/api/soc", lambda params, body: self._platform.soc_snapshot())
+        add(
+            "GET",
+            "/api/soc/reconciliation",
+            lambda params, body: self._platform.soc_reconciliation(limit=int(params.get("limit", 20))),
+        )
         add("GET", "/api/balance", lambda params, body: self._platform.balance_snapshot())
         add("GET", "/api/quota", lambda params, body: self._platform.quota_snapshot())
         add("GET", "/api/audit", self._audit)

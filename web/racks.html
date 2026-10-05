@@ -15,6 +15,12 @@
 <body>
   <h1>电池簇状态</h1>
   <p id="summary">读取中…</p>
+  <h2>SOC（页面与调度同一发布值）</h2>
+  <table>
+    <tbody id="soc-rows">
+      <tr><td colspan="2">读取中…</td></tr>
+    </tbody>
+  </table>
   <table>
     <thead>
       <tr><th>簇</th><th>分区</th><th>SOC</th><th>电压(V)</th><th>压差(mV)</th><th>最高温(℃)</th><th>额定值代际</th></tr>
@@ -22,6 +28,21 @@
     <tbody id="rows"></tbody>
   </table>
   <script>
+    async function loadSoc() {
+      const payload = await (await fetch("/api/soc")).json();
+      const current = payload.current;
+      const deviation = payload.deviation;
+      const rows = document.getElementById("soc-rows");
+      const alarm = deviation.exceeded
+        ? ` <span class="alarm">偏差越限：估算 ${deviation.soc_pct}% / 调度采用 ${deviation.reported_pct}%（容差 ${deviation.tolerance_pct}）</span>`
+        : "";
+      rows.innerHTML =
+        `<tr><th>SOC</th><td>${current.soc_pct}%${alarm}</td></tr>` +
+        `<tr><th>校准代际</th><td>${current.calibration_epoch}${current.stale ? " <span class='warn'>(已过期)</span>" : ""}</td></tr>` +
+        `<tr><th>发布修订号</th><td>${current.revision} @ ${current.published_at}</td></tr>` +
+        `<tr><th>调度采用值</th><td>${deviation.reported_pct}%（偏差 ${deviation.drift_pct}）</td></tr>`;
+    }
+
     async function load() {
       const response = await fetch("/api/racks");
       const payload = await response.json();
@@ -38,6 +59,7 @@
       const status = await (await fetch("/api/status")).json();
       document.getElementById("summary").textContent =
         `站点 ${status.station}｜运行 ${status.running}｜周期 ${status.cycles}｜操作 ${status.operations}`;
+      await loadSoc();
     }
     load();
     setInterval(load, 5000);

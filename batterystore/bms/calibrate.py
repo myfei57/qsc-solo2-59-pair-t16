@@ -56,6 +56,7 @@ class Calibration:
                 "stamped_at": round(self._stamped_at, 3),
                 "age_s": round(max(0.0, float(now) - self._stamped_at), 2),
                 "expired": self._expired(now),
+                "source": self._history[-1]["source"] if self._history else "init",
             }
 
     def _expired(self, now: float) -> bool:

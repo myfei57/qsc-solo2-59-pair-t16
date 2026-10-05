@@ -1,7 +1,10 @@
 """库仑累计。
 
 充电按库仑效率折算，放电按实际安时计入。累计器只关心安时，不关心 SOC；
-SOC 基准由最近一次校准给出，两者分开才能保证"校准一换、估算立刻跟着换"。
+SOC 基准由校准代际锚点给出，两者分开才能保证"校准一换、估算立刻跟着换"。
+
+累计器在整个生命周期内连续累加、从不清零：跨校准段对账依赖校准前的
+充放吞吐量，清零会把上一段的账抹掉（口径说明见 :mod:`batterystore.soc.ledger`）。
 """
 
 from __future__ import annotations
@@ -57,16 +60,3 @@ class CoulombCounter:
         """返回累计推进次数。"""
 
         return self._intervals
-
-    def reset(self) -> dict:
-        """清零累计量，返回清零前的值。"""
-
-        previous = {
-            "charged_ah": round(self._charged_ah, 6),
-            "discharged_ah": round(self._discharged_ah, 6),
-            "net_ah": round(self.net_ah(), 6),
-        }
-        self._charged_ah = 0.0
-        self._discharged_ah = 0.0
-        self._intervals = 0
-        return previous
