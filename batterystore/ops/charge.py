@@ -76,7 +76,7 @@ def charge_rack(
             violations.append("quota_exceeded")
             flow.append({"component": "quota", "action": "charge_rejected", "detail": error.as_record()})
             break
-        delta_ah = soc.accumulate(abs(current), dt)
+        delta_ah = soc.accumulate(abs(current), dt, now)
         flow.append(
             {
                 "component": "soc",
@@ -86,7 +86,7 @@ def charge_rack(
         )
         grid.record_flow(-abs(current) * rack.voltage_v() / 1000.0, dt)
 
-    estimate = soc.value(now)
+    estimate = soc.current(now)
     rack.set_soc(estimate.soc_pct)
     flow.append({"component": "soc", "action": "estimate", "detail": estimate.as_dict()})
     return {"station": station, "ok": not violations, "steps": flow, "violations": violations}

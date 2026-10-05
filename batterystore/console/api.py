@@ -100,6 +100,7 @@ class Api:
         add("POST", "/api/disturb", self._disturb)
         add("POST", "/api/probe/pcs", self._probe_pcs)
         add("POST", "/api/probe/fault", self._probe_fault)
+        add("POST", "/api/probe/soc", self._probe_soc)
 
     def routes(self) -> list[dict]:
         """返回接口清单，供自检与文档核对。"""
@@ -261,3 +262,9 @@ class Api:
 
     def _probe_fault(self, params: dict, body: dict) -> dict:
         return self._platform.concurrency_fault_probe(rounds=_as_int(body, "rounds", 16))
+
+    def _probe_soc(self, params: dict, body: dict) -> dict:
+        return self._platform.concurrency_soc_probe(
+            readers=_as_int(body, "readers", 8),
+            rounds=_as_int(body, "rounds", 64),
+        )

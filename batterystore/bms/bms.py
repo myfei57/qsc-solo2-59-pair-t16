@@ -25,14 +25,21 @@ from .status import BmsStatus
 class Bms:
     """电池管理系统组件。"""
 
-    def __init__(self, limits: BmsLimits, clock, rack_limits: RackLimits, soc_ttl_s: float) -> None:
+    def __init__(
+        self,
+        limits: BmsLimits,
+        clock,
+        rack_limits: RackLimits,
+        soc_ttl_s: float,
+        initial_soc_pct: float = 50.0,
+    ) -> None:
         self._limits = limits
         self._rack_limits = rack_limits
         self._clock = clock
         self._status = BmsStatus()
         self._latch = FaultLatch(limits.fault_latch_s)
         self._faults = FaultRegistry(self._latch, limits.confirm_rounds)
-        self._calibration = Calibration(soc_ttl_s, 50.0)
+        self._calibration = Calibration(soc_ttl_s, initial_soc_pct)
         self._gate = ReadyGate(limits)
         self._route_misses = 0
 

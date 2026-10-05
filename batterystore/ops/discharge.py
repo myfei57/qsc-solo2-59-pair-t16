@@ -50,8 +50,8 @@ def discharge_rack(
         flow.append({"component": "quota", "action": "discharge_rejected", "detail": error.as_record()})
         return {"station": station, "ok": False, "steps": flow, "violations": violations}
 
-    delta_ah = soc.accumulate(-abs(point["ramped_kw"]) * 1000.0 / max(rack.voltage_v(), 1e-9), dt)
-    estimate = soc.value(now)
+    delta_ah = soc.accumulate(-abs(point["ramped_kw"]) * 1000.0 / max(rack.voltage_v(), 1e-9), dt, now)
+    estimate = soc.current(now)
     rack.set_soc(estimate.soc_pct)
     flow.append(
         {

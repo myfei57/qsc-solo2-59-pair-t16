@@ -94,6 +94,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     calibration = platform.calibrate_soc(68.0, "demo")
     probe = platform.concurrency_probe(rounds=args.rounds)
     fault_probe = platform.concurrency_fault_probe(rounds=8)
+    soc_probe = platform.concurrency_soc_probe(rounds=32)
     alarms = platform.alerts()
     shutdown = platform.stop()
 
@@ -117,6 +118,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "calibration": calibration,
         "concurrency": probe,
         "concurrency_fault": fault_probe,
+        "concurrency_soc": soc_probe,
         "alerts": alarms,
         "shutdown": shutdown,
         "probe": endpoints,
@@ -133,6 +135,8 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         failures.append("concurrency_probe")
     if not fault_probe["ok"]:
         failures.append("fault_probe")
+    if not soc_probe["ok"]:
+        failures.append("soc_probe")
     if not all(item["present"] for item in pages):
         failures.append("pages_missing")
     if failures:

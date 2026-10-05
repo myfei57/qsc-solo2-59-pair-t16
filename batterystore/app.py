@@ -33,7 +33,7 @@ from .rack.cells import Cell
 from .rack.mapping import RackMapping
 from .rack.pack import Pack
 from .rack.rack import Rack
-from .soc.soc import SocEstimator
+from .soc.soc import CORRECTION_ALARM, DRIFT_ALARM, SocEstimator
 from .store.journal import JsonlJournal
 from .store.jsonfile import JsonStore
 from .temp.temp import TempControl
@@ -98,12 +98,18 @@ class Platform:
             self.racks[rack_id] = build_rack(rack_id, f"R{index + 1}", zone, self.config)
             self.mapping.assign(rack_id, f"R{index + 1}", zone)
 
-        self.bms = Bms(self.config.bms, self.clock, self.config.rack, self.config.soc.calibrate_ttl_s)
+        self.bms = Bms(
+            self.config.bms,
+            self.clock,
+            self.config.rack,
+            self.config.soc.calibrate_ttl_s,
+            initial_soc_pct=self.config.soc.initial_soc_pct,
+        )
         self.pcs = Pcs(self.config.pcs)
         self.temp = TempControl(self.config.temp)
         self.fire = FireLinkage(self.config.fire, [f"Z{i + 1}" for i in range(self.config.fire.zone_count)])
         self.grid = GridTie(self.config.grid)
-        self.soc = SocEstimator(self.config.soc, self.bms.calibration)
+        self.soc = SocEstimator(self.config.soc, self.bms.calibration, alarm=self._soc_drift_alarm)
         self.balancer = Balancer(self.config.balance)
         self.quota = QuotaLedger(self.config.quota)
 
@@ -116,7 +122,49 @@ class Platform:
         self._lock = threading.RLock()
         self._register_namespaces()
         self._restore()
-        self.bms.calibration.record(self.config.soc.initial_soc_pct, self.clock.now(), "startup")
+        startup = self.bms.calibration.record(self.config.soc.initial_soc_pct, self.clock.now(), "startup")
+        self.soc.begin_epoch(startup["epoch"], startup["soc_pct"], startup["stamped_at"], "startup")
+
+    def _soc_drift_alarm(self, kind: str, estimate, published: dict) -> None:
+        """SOC 偏差越限的边沿告警（两种口径各一条）。
+
+        ``drift_exceeded``：累计推算相对最近权威基准漂出容差，账面与估算
+        背离，调度按账面放电有过放风险；``correction_exceeded``：新一代
+        校准把基准挪动超过容差（实测 30%、账面 45% 那种偏差在校准一刻被
+        抓到），调度必须立刻改按新基准。
+        """
+
+        if kind == CORRECTION_ALARM:
+            message = (
+                f"SOC 校准修正量 {estimate.correction_pct:+.1f}% 超过容差 "
+                f"{estimate.drift_tolerance_pct:.1f}%（新基准 {estimate.soc_pct:.1f}%，"
+                f"校准代际 {estimate.calibration_epoch}），调度应立即改按新基准"
+            )
+            action = "correction_exceeded"
+            deviation_pct = estimate.correction_pct
+        else:
+            message = (
+                f"SOC 估算漂移 {estimate.drift_pct:+.1f}% 超过容差 "
+                f"{estimate.drift_tolerance_pct:.1f}%（估算 {estimate.soc_pct:.1f}%，"
+                f"基准 {estimate.base_soc_pct:.1f}%，校准代际 {estimate.calibration_epoch}）"
+            )
+            action = "drift_exceeded"
+            deviation_pct = estimate.drift_pct
+        self.bus.publish(
+            Event.of(
+                "soc",
+                "soc",
+                action,
+                station=self.station,
+                severity="alarm",
+                message=message,
+                kind=kind,
+                soc_pct=estimate.soc_pct,
+                deviation_pct=round(deviation_pct, 3),
+                drift_tolerance_pct=round(estimate.drift_tolerance_pct, 3),
+                calibration_epoch=estimate.calibration_epoch,
+            )
+        )
 
     def _register_namespaces(self) -> None:
         """登记现场设备命名空间（控制台与审计共用同一套名字）。"""
@@ -169,6 +217,16 @@ class Platform:
         if key not in self.racks:
             raise KeyError(f"未知的簇: {key}")
         return self.racks[key]
+
+    def _sync_rack_soc(self) -> None:
+        """把已发布 SOC 同步到全部簇，保证各簇与单一发布值一致。"""
+
+        published = self.soc.published()
+        soc_pct = published.get("soc_pct")
+        if soc_pct is None:
+            return
+        for rack in self.racks.values():
+            rack.set_soc(float(soc_pct))
 
     def _record_operation(self, op_id: str, operation: str, report: dict) -> dict:
         """把编排步骤逐条写审计，并记一条汇总事件。"""
@@ -337,6 +395,7 @@ class Platform:
                 dt=dt,
                 now=self.clock.now(),
             )
+            self._sync_rack_soc()
             summary = self._record_operation(op_id, "discharge", report)
             return {**report, **summary}
 
@@ -360,6 +419,7 @@ class Platform:
                 dt=dt,
                 now=self.clock.now(),
             )
+            self._sync_rack_soc()
             summary = self._record_operation(op_id, "charge", report)
             return {**report, **summary}
 
@@ -438,21 +498,53 @@ class Platform:
             return {**report, **summary}
 
     def calibrate_soc(self, soc_pct: float, source: str = "manual") -> dict:
-        """登记一次 SOC 校准并按新基准重估。"""
+        """登记一次 SOC 校准并立即按新基准重估（封存旧段、开新段）。
+
+        裁决先于登记：这版校准若比最近一次生效写入更早发生（迟到校准），
+        按"晚者为准"判负——不推进 BMS 校准代际、不换基准，只留冲突记录，
+        避免估算代际与 BMS 代际分叉。
+        """
 
         with self._lock:
             op_id = self.ids.next()
+            now = self.clock.now()
+            rejected = self.soc.check_calibration(soc_pct, now)
+            if rejected is not None:
+                self.bus.publish(
+                    Event.of(
+                        "soc",
+                        "soc",
+                        "calibration_rejected",
+                        station=self.station,
+                        severity="warning",
+                        message=f"迟到的 SOC 校准被判负丢弃：校准时刻 {rejected['rejected_ts']} 早于已生效写入 {rejected['held_ts']}",
+                        **rejected,
+                    )
+                )
+                report = {
+                    "station": self.station,
+                    "ok": False,
+                    "steps": [{"component": "soc", "action": "reject_late_calibration", "detail": rejected}],
+                    "violations": ["late_calibration_rejected"],
+                }
+                summary = self._record_operation(op_id, "calibrate", report)
+                return {**report, **summary}
             record = self.bms.calibrate(soc_pct, source)
-            self.soc.reset()
-            estimate = self.soc.value(self.clock.now())
-            for rack in self.racks.values():
-                rack.set_soc(estimate.soc_pct)
-            self.soc.report(soc_pct)
+            previous = self.soc.published()
+            estimate = self.soc.apply_calibration(record, now, float(previous.get("soc_pct", soc_pct)))
+            self._sync_rack_soc()
             steps = [
                 {"component": "bms", "action": "calibrate", "detail": record},
                 {"component": "soc", "action": "estimate", "detail": estimate.as_dict()},
             ]
-            report = {"station": self.station, "ok": True, "steps": steps, "violations": []}
+            report = {
+                "station": self.station,
+                "ok": True,
+                "steps": steps,
+                "violations": [],
+                "previous_published": previous,
+                "segments_reconciled": self.soc.reconcile_segments(),
+            }
             summary = self._record_operation(op_id, "calibrate", report)
             return {**report, **summary}
 
@@ -526,14 +618,26 @@ class Platform:
             return self.grid.monitor_frequency(frequency_hz, self.clock.now())
 
     def set_soc(self, rack_id: str | None = None, soc_pct: float = 50.0) -> dict:
-        """直接写入某簇 SOC（现场标定用）。"""
+        """现场标定某簇 SOC。
+
+        现场直接写入与 BMS 校准是同一类"基准来源"：必须走校准流水线推进
+        代际、封存旧段、按新基准重估，而不是只改一个簇的快照让估算下一周期
+        又把它盖回去。标定值仍先按簇 SOC 窗口夹取。
+        """
 
         with self._lock:
             rack = self._rack(rack_id)
             bounded = self.config.rack.clamp_soc(soc_pct)
-            previous = rack.set_soc(bounded)
-            self.soc.report(bounded)
-            return {"rack_id": rack.rack_id, "previous_pct": round(previous, 3), "soc_pct": round(rack.soc_pct(), 3)}
+            previous = rack.soc_pct()
+            result = self.calibrate_soc(bounded, source=f"field:{rack.rack_id}")
+            estimate = self.soc.current(self.clock.now())
+            return {
+                "rack_id": rack.rack_id,
+                "previous_pct": round(previous, 3),
+                "soc_pct": round(estimate.soc_pct, 3),
+                "calibration_epoch": estimate.calibration_epoch,
+                "ok": result["ok"],
+            }
 
     def disturb_cell(self, rack_id: str | None = None, cell_index: int = 0, delta_v: float = 0.03) -> dict:
         """人为制造单体偏差，用于复现压差越限与均衡场景。"""
@@ -573,7 +677,8 @@ class Platform:
                     trips.append(f"{rack_id}:{','.join(violations)}")
                     self.pcs.trip(f"protection:{rack_id}")
                 self.bms.ready(rack)
-                estimate = self.soc.value(now)
+            estimate = self.soc.value(now)
+            for rack in self.racks.values():
                 rack.set_soc(estimate.soc_pct)
             rolled = self.quota.roll(now)
             self.grid.monitor_frequency(50.0, now)
@@ -621,6 +726,62 @@ class Platform:
             "illegal_states": illegal,
             "rejections": len(errors),
             "ok": not illegal,
+        }
+
+    def concurrency_soc_probe(self, readers: int = 8, rounds: int = 64) -> dict:
+        """并发探测：多个消费者同时读 SOC，并核对读到的是同一个值。
+
+        每一轮所有读者在同一屏障后同时读，读窗口内不放任何写入，因此同一轮
+        内页面与调度拿到的 (soc_pct, epoch) 必须完全一致；每轮结束后再统一
+        推进一次累计写入，模拟真实的"周期发布、多端同读"。出现两种值即说明
+        发布不是原子的（页面一个数、调度一个数）。
+        """
+
+        mismatches: list[dict] = []
+        lock = threading.Lock()
+        start = threading.Barrier(readers + 1)
+        sampled = threading.Barrier(readers + 1)
+
+        def reader(kind: str) -> None:
+            for index in range(rounds):
+                start.wait()
+                if kind == "scheduler":
+                    estimate = self.soc.current(self.clock.now())
+                    sample = (round(estimate.soc_pct, 6), estimate.calibration_epoch)
+                else:
+                    published = self.soc.published()
+                    sample = (
+                        round(float(published.get("soc_pct", 0.0)), 6),
+                        int(published.get("calibration_epoch", 0)),
+                    )
+                with lock:
+                    groups[index].append(sample)
+                sampled.wait()
+
+        groups: list[list[tuple]] = [[] for _ in range(rounds)]
+        threads = [threading.Thread(target=reader, args=("page",), name=f"soc-page-{i}") for i in range(readers // 2)]
+        threads += [
+            threading.Thread(target=reader, args=("scheduler",), name=f"soc-sched-{i}")
+            for i in range(readers - readers // 2)
+        ]
+        for thread in threads:
+            thread.start()
+        for index in range(rounds):
+            start.wait()
+            sampled.wait()
+            with self._lock:
+                self.soc.accumulate(10.0, 1.0, self.clock.now() + index + 1)
+            distinct = set(groups[index])
+            if len(distinct) > 1:
+                mismatches.append({"round": index + 1, "values": sorted(distinct)})
+        for thread in threads:
+            thread.join(timeout=30)
+        return {
+            "readers": readers,
+            "rounds": rounds,
+            "samples": sum(len(group) for group in groups),
+            "mismatches": mismatches,
+            "ok": not mismatches,
         }
 
     def concurrency_fault_probe(self, rounds: int = 16) -> dict:
